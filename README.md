@@ -1,7 +1,3 @@
-Of course! Here is the `README.md` content ready to be copied and pasted.
-
----
-
 # Cipher Converter: AI Subtitle Generator
 
 Cipher Converter is a sleek, single-file web application that automatically generates subtitle files (`.srt`) from audio or video sources. It leverages the power of the Hugging Face Inference API, specifically using OpenAI's Whisper model, to provide fast and accurate transcriptions with timestamps.
