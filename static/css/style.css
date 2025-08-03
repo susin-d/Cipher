@@ -1,0 +1,67 @@
+/* --- Global Styles & Font --- */
+body {
+    font-family: 'Inter', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* --- Main Glass Effect Card --- */
+.glass-effect {
+    background: rgba(18, 18, 28, 0.7);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+}
+
+/* --- Canvas Background --- */
+#waveCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 0;
+}
+
+
+/* --- NEW: Glossy Glass Button Style --- */
+/* This reusable class will style both of our buttons */
+.glass-button {
+    background: rgba(255, 255, 255, 0.1); /* Semi-transparent white background */
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.2); /* Subtle white border */
+    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1); /* Soft shadow for depth */
+    transition: all 0.3s ease;
+    /* Font and padding are handled by Tailwind classes in the HTML */
+}
+
+/* Hover effect for the glass button */
+.glass-button:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.2); /* Get slightly brighter on hover */
+    border: 1px solid rgba(255, 255, 255, 0.4);
+    transform: scale(1.05); /* Add a pop effect */
+}
+
+/* Disabled state */
+.glass-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+
+/* --- UPDATED: Custom File Upload Styling --- */
+/* We no longer need all the styling here because we'll use the .glass-button class */
+input[type="file"] {
+    display: none;
+}
+
+.custom-file-upload {
+    display: inline-block;
+    cursor: pointer;
+    /* All appearance styles (background, border, etc.) are now controlled by .glass-button */
+}
+
+/* -- Utility Class -- */
+.hidden {
+    display: none !important;
+}

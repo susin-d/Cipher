@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Subtitle Generator</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="static/css/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="bg-[#0b0b12] min-h-screen flex items-center justify-center p-4 relative overflow-hidden">
+    <canvas id="waveCanvas"></canvas>
+
+    <div class="glass-effect p-8 rounded-lg shadow-2xl w-full max-w-md text-center border border-gray-700/50 z-10">
+        <h1 class="text-3xl font-bold text-gray-100 mb-6">Cipher Converter</h1>
+        <p class="text-gray-300 mb-8">Upload an MP3, MP4, M4A, or WAV file to generate SRT subtitles automatically.</p>
+
+        <!-- Applying glass-button class to the file chooser label -->
+        <div class="mb-6 flex justify-center">
+            <label for="fileInputFiles" class="custom-file-upload glass-button text-gray-200 font-semibold py-3 px-6 rounded-lg">
+                Choose File
+            </label>
+            <input type="file" id="fileInputFiles" accept=".mp3, .mp4, .wav, .m4a">
+        </div>
+        <p id="fileNameDisplay" class="mt-4 text-gray-400 text-sm italic h-5"></p>
+
+        <!-- Applying glass-button class to the process button and removing old background classes -->
+        <button id="processButton"
+            class="w-full glass-button text-white font-semibold py-3 px-4 rounded-lg"
+            disabled>
+            Process File
+        </button>
+
+        <!-- Loading Indicator -->
+        <div id="loadingIndicator" class="mt-4 hidden">
+            <div class="flex justify-center items-center space-x-2">
+                <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <p class="text-sm text-gray-400">Processing... this may take a moment.</p>
+            </div>
+        </div>
+
+        <!-- Download Area -->
+        <div id="downloadLinksContainer" class="hidden mt-6">
+            <h3 class="text-lg font-semibold text-gray-200 mb-2">Download Your File:</h3>
+            <div id="downloadLinksList" class="text-center"></div>
+        </div>
+
+        <!-- General Message Area for errors or success -->
+        <div id="messageArea" class="mt-6 text-sm text-red-400 min-h-[20px]"></div>
+    </div>
+
+    <script src="static/js/script.js" defer></script>
+</body>
+</html>
