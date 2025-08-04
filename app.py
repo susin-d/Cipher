@@ -32,7 +32,7 @@ if not HF_TOKEN:
 API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
 
 
-# --- SRT Formatting Helper Function (Unchanged) ---
+# --- SRT Formatting Helper Function ---
 def format_to_srt(chunks):
     srt_content = []
     for i, chunk in enumerate(chunks):
@@ -43,11 +43,11 @@ def format_to_srt(chunks):
         end_delta = timedelta(seconds=end_time_sec)
         start_srt_time = f"{int(start_delta.total_seconds()) // 3600:02d}:{int(start_delta.total_seconds()) // 60 % 60:02d}:{int(start_delta.total_seconds()) % 60:02d},{start_delta.microseconds // 1000:03d}"
         end_srt_time = f"{int(end_delta.total_seconds()) // 3600:02d}:{int(end_delta.total_seconds()) // 60 % 60:02d}:{int(end_delta.total_seconds()) % 60:02d},{end_delta.microseconds // 1000:03d}"
-        srt_content.append(f"{i + 1}\n{start_srt_time} --> {end_time}\n{text}\n")
+        srt_content.append(f"{i + 1}\n{start_srt_time} --> {end_srt_time}\n{text}\n")
     return "\n".join(srt_content)
 
 
-# --- API Endpoint (MODIFIED to handle Video and Audio) ---
+# --- API Endpoint (Handles Video and Audio) ---
 @app.post("/api/process_hf")
 async def process_audio_with_huggingface(file: UploadFile = File(...)):
     if not HF_TOKEN:
@@ -55,27 +55,21 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
     
     logging.info(f"--- API call received for file: {file.filename} ---")
     
-    # Initialize temporary file paths to None for robust cleanup
     input_temp_path = None
     output_temp_path = None
     
     try:
         # 1. Save uploaded file to a temporary location
-        # Using NamedTemporaryFile with delete=False allows us to get a path
-        # that FFmpeg can use.
         with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as temp_file:
             content = await file.read()
             temp_file.write(content)
             input_temp_path = temp_file.name
 
         # 2. Extract audio using FFmpeg
-        # Define the path for the extracted audio output (MP3 format)
         output_temp_path = os.path.splitext(input_temp_path)[0] + ".mp3"
 
         logging.info(f"Extracting audio from '{input_temp_path}' to '{output_temp_path}'")
         try:
-            # This command takes the input file and outputs an MP3 audio file.
-            # It works for both audio and video inputs.
             (
                 ffmpeg
                 .input(input_temp_path)
@@ -84,7 +78,6 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
             )
             logging.info("Audio extraction successful.")
         except ffmpeg.Error as e:
-            # If FFmpeg fails, log the error and inform the user.
             error_details = e.stderr.decode() if e.stderr else "Unknown FFmpeg error"
             logging.error(f"FFmpeg Error: {error_details}")
             raise HTTPException(status_code=500, detail=f"Failed to process media file. FFmpeg error: {error_details}")
@@ -124,10 +117,8 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
         # 5. IMPORTANT: Clean up the temporary files
         if input_temp_path and os.path.exists(input_temp_path):
             os.remove(input_temp_path)
-            logging.info(f"Deleted temporary input file: {input_temp_path}")
         if output_temp_path and os.path.exists(output_temp_path):
             os.remove(output_temp_path)
-            logging.info(f"Deleted temporary output file: {output_temp_path}")
 
 # --- Embedded Frontend Content ---
 
@@ -149,25 +140,22 @@ HTML_CONTENT = """
 
     <div class="glass-effect p-8 rounded-lg shadow-2xl w-full max-w-md text-center border border-gray-700/50 z-10">
         <h1 class="text-3xl font-bold text-gray-100 mb-6">Cipher Converter</h1>
-        <p class="text-gray-300 mb-8">Upload an MP3, MP4, M4A, WAV, or MOV file to generate SRT subtitles automatically.</p>
+        <p class="text-gray-300 mb-8">Upload any video or audio file (MP4, MOV, MP3, etc.) to generate SRT subtitles automatically.</p>
 
-        <!-- Applying glass-button class to the file chooser label -->
         <div class="mb-6 flex justify-center">
             <label for="fileInputFiles" class="custom-file-upload glass-button text-gray-200 font-semibold py-3 px-6 rounded-lg">
                 Choose File
             </label>
-            <input type="file" id="fileInputFiles" accept=".mp3,.mp4,.wav,.m4a,.mov,.avi,.mkv" style="display: none;">
+            <input type="file" id="fileInputFiles" accept="audio/*,video/*" style="display: none;">
         </div>
         <p id="fileNameDisplay" class="mt-4 text-gray-400 text-sm italic h-5"></p>
 
-        <!-- Applying glass-button class to the process button and removing old background classes -->
         <button id="processButton"
             class="w-full glass-button text-white font-semibold py-3 px-4 rounded-lg"
             disabled>
             Process File
         </button>
 
-        <!-- Loading Indicator -->
         <div id="loadingIndicator" class="mt-4 hidden">
             <div class="flex justify-center items-center space-x-2">
                 <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -178,13 +166,11 @@ HTML_CONTENT = """
             </div>
         </div>
 
-        <!-- Download Area -->
         <div id="downloadLinksContainer" class="hidden mt-6">
             <h3 class="text-lg font-semibold text-gray-200 mb-2">Download Your File:</h3>
             <div id="downloadLinksList" class="text-center"></div>
         </div>
 
-        <!-- General Message Area for errors or success -->
         <div id="messageArea" class="mt-6 text-sm text-red-400 min-h-[20px]"></div>
     </div>
 
@@ -219,34 +205,28 @@ body {
 }
 
 
-/* --- NEW: Glossy Glass Button Style --- */
-/* This reusable class will style both of our buttons */
+/* --- Glossy Glass Button Style --- */
 .glass-button {
-    background: rgba(255, 255, 255, 0.1); /* Semi-transparent white background */
+    background: rgba(255, 255, 255, 0.1);
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
-    border: 1px solid rgba(255, 255, 255, 0.2); /* Subtle white border */
-    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1); /* Soft shadow for depth */
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
     transition: all 0.3s ease;
-    /* Font and padding are handled by Tailwind classes in the HTML */
 }
 
-/* Hover effect for the glass button */
 .glass-button:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.2); /* Get slightly brighter on hover */
+    background: rgba(255, 255, 255, 0.2);
     border: 1px solid rgba(255, 255, 255, 0.4);
-    transform: scale(1.05); /* Add a pop effect */
+    transform: scale(1.05);
 }
 
-/* Disabled state */
 .glass-button:disabled {
     opacity: 0.5;
     cursor: not-allowed;
 }
 
-
-/* --- UPDATED: Custom File Upload Styling --- */
-/* We no longer need all the styling here because we'll use the .glass-button class */
+/* --- Custom File Upload Styling --- */
 input[type="file"] {
     display: none;
 }
@@ -254,10 +234,8 @@ input[type="file"] {
 .custom-file-upload {
     display: inline-block;
     cursor: pointer;
-    /* All appearance styles (background, border, etc.) are now controlled by .glass-button */
 }
 
-/* -- Utility Class -- */
 .hidden {
     display: none !important;
 }
@@ -456,14 +434,17 @@ document.addEventListener('DOMContentLoaded', () => {
 # --- Static File Serving (from embedded content) ---
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
+    """Serves the main HTML page."""
     return HTMLResponse(content=HTML_CONTENT)
 
 @app.get("/static/css/style.css")
 async def read_css():
+    """Serves the CSS file."""
     return Response(content=CSS_CONTENT, media_type="text/css")
 
 @app.get("/static/js/script.js")
 async def read_js():
+    """Serves the JavaScript file."""
     return Response(content=JS_CONTENT, media_type="application/javascript")
 
 
