@@ -3,6 +3,8 @@ import logging
 import requests
 import time
 import uvicorn
+import tempfile
+import ffmpeg  # <-- Import the ffmpeg-python library
 from datetime import timedelta
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, Response, PlainTextResponse
@@ -10,9 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 # --- Basic Configuration ---
-# Load environment variables from a .env file for local development
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = FastAPI()
 
@@ -26,15 +26,13 @@ app.add_middleware(
 )
 
 # --- Hugging Face API Configuration ---
-# On Render, this is set as an environment variable.
 HF_TOKEN = os.environ.get('HUGGING_FACE_TOKEN')
 if not HF_TOKEN:
     logging.warning("HUGGING_FACE_TOKEN not found in environment. The API will not work.")
-
 API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
 
 
-# --- SRT Formatting Helper Function ---
+# --- SRT Formatting Helper Function (Unchanged) ---
 def format_to_srt(chunks):
     srt_content = []
     for i, chunk in enumerate(chunks):
@@ -45,29 +43,67 @@ def format_to_srt(chunks):
         end_delta = timedelta(seconds=end_time_sec)
         start_srt_time = f"{int(start_delta.total_seconds()) // 3600:02d}:{int(start_delta.total_seconds()) // 60 % 60:02d}:{int(start_delta.total_seconds()) % 60:02d},{start_delta.microseconds // 1000:03d}"
         end_srt_time = f"{int(end_delta.total_seconds()) // 3600:02d}:{int(end_delta.total_seconds()) // 60 % 60:02d}:{int(end_delta.total_seconds()) % 60:02d},{end_delta.microseconds // 1000:03d}"
-        srt_content.append(f"{i + 1}\n{start_srt_time} --> {end_srt_time}\n{text}\n")
+        srt_content.append(f"{i + 1}\n{start_srt_time} --> {end_time}\n{text}\n")
     return "\n".join(srt_content)
 
 
-# --- API Endpoint (The Backend Logic) ---
+# --- API Endpoint (MODIFIED to handle Video and Audio) ---
 @app.post("/api/process_hf")
 async def process_audio_with_huggingface(file: UploadFile = File(...)):
     if not HF_TOKEN:
         raise HTTPException(status_code=500, detail="Server is not configured with an API token.")
     
     logging.info(f"--- API call received for file: {file.filename} ---")
+    
+    # Initialize temporary file paths to None for robust cleanup
+    input_temp_path = None
+    output_temp_path = None
+    
     try:
-        audio_data = await file.read()
-        request_headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": file.content_type}
+        # 1. Save uploaded file to a temporary location
+        # Using NamedTemporaryFile with delete=False allows us to get a path
+        # that FFmpeg can use.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            input_temp_path = temp_file.name
+
+        # 2. Extract audio using FFmpeg
+        # Define the path for the extracted audio output (MP3 format)
+        output_temp_path = os.path.splitext(input_temp_path)[0] + ".mp3"
+
+        logging.info(f"Extracting audio from '{input_temp_path}' to '{output_temp_path}'")
+        try:
+            # This command takes the input file and outputs an MP3 audio file.
+            # It works for both audio and video inputs.
+            (
+                ffmpeg
+                .input(input_temp_path)
+                .output(output_temp_path, acodec='libmp3lame', audio_bitrate='192k')
+                .run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+            )
+            logging.info("Audio extraction successful.")
+        except ffmpeg.Error as e:
+            # If FFmpeg fails, log the error and inform the user.
+            error_details = e.stderr.decode() if e.stderr else "Unknown FFmpeg error"
+            logging.error(f"FFmpeg Error: {error_details}")
+            raise HTTPException(status_code=500, detail=f"Failed to process media file. FFmpeg error: {error_details}")
+
+        # 3. Read the extracted audio data
+        with open(output_temp_path, 'rb') as f:
+            audio_data = f.read()
+
+        # 4. Send the extracted audio to Hugging Face API
+        request_headers = {"Authorization": f"Bearer {HF_TOKEN}"}
         params = {"return_timestamps": "chunk"}
         
         start_time = time.time()
-        # Set a generous timeout (e.g., 5 minutes) for large files
+        logging.info("Sending extracted audio to Hugging Face API...")
         response = requests.post(API_URL, headers=request_headers, data=audio_data, params=params, timeout=300)
         duration = time.time() - start_time
         logging.info(f"AI model processing took {duration:.2f} seconds.")
         
-        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+        response.raise_for_status()
         
         result = response.json()
         srt_output = format_to_srt(result.get('chunks', []))
@@ -76,16 +112,22 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
     except requests.exceptions.HTTPError as http_err:
         error_detail = "Unknown error"
         try:
-            # Try to parse JSON error from Hugging Face
             error_detail = http_err.response.json().get('error', http_err.response.text)
         except requests.exceptions.JSONDecodeError:
-            # If the response is not JSON, use the raw text
             error_detail = http_err.response.text
         logging.error(f"Hugging Face API Error: {error_detail}")
         raise HTTPException(status_code=502, detail=f"AI model processing failed: {error_detail}")
     except Exception as e:
         logging.error(f"An internal error occurred: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # 5. IMPORTANT: Clean up the temporary files
+        if input_temp_path and os.path.exists(input_temp_path):
+            os.remove(input_temp_path)
+            logging.info(f"Deleted temporary input file: {input_temp_path}")
+        if output_temp_path and os.path.exists(output_temp_path):
+            os.remove(output_temp_path)
+            logging.info(f"Deleted temporary output file: {output_temp_path}")
 
 # --- Embedded Frontend Content ---
 
@@ -107,14 +149,14 @@ HTML_CONTENT = """
 
     <div class="glass-effect p-8 rounded-lg shadow-2xl w-full max-w-md text-center border border-gray-700/50 z-10">
         <h1 class="text-3xl font-bold text-gray-100 mb-6">Cipher Converter</h1>
-        <p class="text-gray-300 mb-8">Upload an MP3, MP4, M4A, or WAV file to generate SRT subtitles automatically.</p>
+        <p class="text-gray-300 mb-8">Upload an MP3, MP4, M4A, WAV, or MOV file to generate SRT subtitles automatically.</p>
 
         <!-- Applying glass-button class to the file chooser label -->
         <div class="mb-6 flex justify-center">
             <label for="fileInputFiles" class="custom-file-upload glass-button text-gray-200 font-semibold py-3 px-6 rounded-lg">
                 Choose File
             </label>
-            <input type="file" id="fileInputFiles" accept=".mp3, .mp4, .wav, .m4a" style="display: none;">
+            <input type="file" id="fileInputFiles" accept=".mp3,.mp4,.wav,.m4a,.mov,.avi,.mkv" style="display: none;">
         </div>
         <p id="fileNameDisplay" class="mt-4 text-gray-400 text-sm italic h-5"></p>
 
@@ -412,20 +454,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
 # --- Static File Serving (from embedded content) ---
-
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
-    """Serves the main HTML page."""
     return HTMLResponse(content=HTML_CONTENT)
 
 @app.get("/static/css/style.css")
 async def read_css():
-    """Serves the CSS file."""
     return Response(content=CSS_CONTENT, media_type="text/css")
 
 @app.get("/static/js/script.js")
 async def read_js():
-    """Serves the JavaScript file."""
     return Response(content=JS_CONTENT, media_type="application/javascript")
 
 
@@ -434,4 +472,5 @@ if __name__ == "__main__":
     print("--- Starting local development server ---")
     print("Access the application at http://127.0.0.1:8000")
     print("Ensure you have a .env file with HUGGING_FACE_TOKEN set.")
+    print("Ensure FFmpeg is installed on your system.")
     uvicorn.run(app, host="127.0.0.1", port=8000)
