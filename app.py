@@ -4,7 +4,7 @@ import requests
 import time
 import uvicorn
 import tempfile
-import ffmpeg  # <-- Import the ffmpeg-python library
+import ffmpeg
 from datetime import timedelta
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, Response, PlainTextResponse
@@ -33,17 +33,47 @@ API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
 
 
 # --- SRT Formatting Helper Function ---
+# REPLACEMENT for the original complex function. This is much cleaner and more accurate.
 def format_to_srt(chunks):
+    """
+    Formats the output from the Whisper API into a standard SRT subtitle file.
+    Handles cases where timestamps might be missing or null.
+    """
+    def format_srt_time(seconds_float):
+        """Converts a float number of seconds to an SRT time string HH:MM:SS,ms."""
+        if seconds_float is None:
+            seconds_float = 0.0
+        
+        # Create a timedelta object to easily extract components
+        delta = timedelta(seconds=seconds_float)
+        
+        # Extract hours, minutes, seconds from the total seconds
+        total_seconds = delta.seconds
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        # Extract milliseconds from the microseconds component
+        milliseconds = delta.microseconds // 1000
+        
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
     srt_content = []
     for i, chunk in enumerate(chunks):
-        start_time_sec = chunk.get('timestamp', [0, None])[0] or 0
-        end_time_sec = chunk.get('timestamp', [None, 0])[1] or start_time_sec
+        # Default to 0 if timestamps are missing or null
+        start_time = chunk.get('timestamp', [0, None])[0] or 0
+        end_time = chunk.get('timestamp', [None, 0])[1]
+
+        # If end_time is null, make it the same as start_time for a valid, 0-duration subtitle
+        if end_time is None:
+            end_time = start_time
+
         text = chunk.get('text', '').strip()
-        start_delta = timedelta(seconds=start_time_sec)
-        end_delta = timedelta(seconds=end_time_sec)
-        start_srt_time = f"{int(start_delta.total_seconds()) // 3600:02d}:{int(start_delta.total_seconds()) // 60 % 60:02d}:{int(start_delta.total_seconds()) % 60:02d},{start_delta.microseconds // 1000:03d}"
-        end_srt_time = f"{int(end_delta.total_seconds()) // 3600:02d}:{int(end_delta.total_seconds()) // 60 % 60:02d}:{int(end_delta.total_seconds()) % 60:02d},{end_delta.microseconds // 1000:03d}"
+
+        start_srt_time = format_srt_time(start_time)
+        end_srt_time = format_srt_time(end_time)
+        
         srt_content.append(f"{i + 1}\n{start_srt_time} --> {end_srt_time}\n{text}\n")
+        
     return "\n".join(srt_content)
 
 
@@ -89,7 +119,7 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
         # 4. Send the extracted audio to Hugging Face API
         request_headers = {
             "Authorization": f"Bearer {HF_TOKEN}",
-            "Content-Type": "audio/mpeg"  # <-- FIX: Added the content type header
+            "Content-Type": "audio/mpeg"
         }
         params = {"return_timestamps": "chunk"}
         
