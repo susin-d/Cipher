@@ -33,72 +33,58 @@ if not HF_TOKEN:
 API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
 
 
-# --- NEW: Word Grouping Function for Perfect Subtitles ---
-def group_words_into_sentences(word_chunks, max_chars=80, max_duration_s=7.0, pause_threshold=0.7):
+# --- FINAL REVISED: Word Grouping Function for Perfect Subtitles ---
+def group_words_into_sentences(word_chunks, max_chars=42, pause_threshold=0.7):
     """
     Groups individual word chunks from the Whisper API into readable sentence chunks.
+    This version uses simpler logic and correctly handles line breaks and text formatting.
     """
     if not word_chunks:
         return []
 
     sentence_chunks = []
     current_sentence = []
-    current_sentence_text = ""
-    sentence_start_time = word_chunks[0]['timestamp'][0]
 
     for i, word_chunk in enumerate(word_chunks):
-        word_text = word_chunk['text']
-        start_time = word_chunk['timestamp'][0]
-        end_time = word_chunk['timestamp'][1]
+        current_sentence.append(word_chunk)
         
-        if end_time is None: # Handle potential null end time for the last word
-            end_time = start_time + 0.5 # Estimate a short duration
+        # --- Correctly form the sentence text by stripping each word ---
+        current_text = ' '.join(w['text'].strip() for w in current_sentence)
 
-        # Check for a long pause between words
-        is_long_pause = False
-        if i > 0:
-            prev_word_end_time = word_chunks[i-1]['timestamp'][1]
-            if prev_word_end_time is not None and start_time - prev_word_end_time > pause_threshold:
-                is_long_pause = True
+        # --- Define break conditions ---
+        is_punctuation_end = word_chunk['text'].strip().endswith(('.', '?', '!'))
+        is_max_len_reached = len(current_text) >= max_chars
+        
+        # Check for a pause after the current word
+        is_pause_after = False
+        if i < len(word_chunks) - 1:
+            next_word_start = word_chunks[i+1]['timestamp'][0]
+            current_word_end = word_chunk['timestamp'][1]
+            if current_word_end is not None and next_word_start is not None:
+                 if next_word_start - current_word_end > pause_threshold:
+                    is_pause_after = True
+        
+        is_last_word = (i == len(word_chunks) - 1)
 
-        # Conditions to finalize the current sentence
-        is_end_of_sentence = word_text.strip().endswith(('.', '?', '!'))
-        is_max_chars_reached = len(current_sentence_text + word_text) > max_chars
-        is_max_duration_reached = (end_time - sentence_start_time) > max_duration_s
+        # --- Finalize the sentence if any break condition is met ---
+        if is_last_word or is_punctuation_end or is_pause_after or is_max_len_reached:
+            if not current_sentence:
+                continue
 
-        if current_sentence and (is_long_pause or is_end_of_sentence or is_max_chars_reached or is_max_duration_reached):
-            # Finalize the sentence
-            last_word_in_sentence = current_sentence[-1]
-            sentence_end_time = last_word_in_sentence['timestamp'][1]
+            start_ts = current_sentence[0]['timestamp'][0]
+            end_ts = current_sentence[-1]['timestamp'][1]
+            
+            # Handle potential null timestamp on the very last word
+            if end_ts is None:
+                end_ts = current_sentence[-1]['timestamp'][0] + 0.5
             
             sentence_chunks.append({
-                'text': ' '.join(w['text'] for w in current_sentence).strip(),
-                'timestamp': [sentence_start_time, sentence_end_time]
+                'text': current_text,
+                'timestamp': [start_ts, end_ts]
             })
-            
-            # Start a new sentence
+            # Reset for the next sentence
             current_sentence = []
-            current_sentence_text = ""
-            sentence_start_time = start_time
-
-        # Add the current word to the new sentence
-        current_sentence.append(word_chunk)
-        current_sentence_text += word_text
-
-    # Add the last remaining sentence
-    if current_sentence:
-        last_word_in_sentence = current_sentence[-1]
-        sentence_end_time = last_word_in_sentence['timestamp'][1]
-        
-        # Ensure the final end_time is not null
-        if sentence_end_time is None:
-             sentence_end_time = last_word_in_sentence['timestamp'][0] + 0.5
-
-        sentence_chunks.append({
-            'text': ' '.join(w['text'] for w in current_sentence).strip(),
-            'timestamp': [sentence_start_time, sentence_end_time]
-        })
-        
+    
     logging.info(f"Grouped {len(word_chunks)} words into {len(sentence_chunks)} sentences.")
     return sentence_chunks
 
@@ -129,9 +115,8 @@ def format_to_srt(chunks):
         end_time_val = chunk.get('timestamp', [None, 0])[1]
         text = chunk.get('text', '').strip()
 
-        # FIX for potential null end time
         if end_time_val is None:
-            end_time_val = start_time_val + 0.5 # Use start time if end is missing
+            end_time_val = start_time_val + 0.5 
 
         start_time = format_srt_time(start_time_val)
         end_time = format_srt_time(end_time_val)
@@ -181,7 +166,6 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
             "Authorization": f"Bearer {HF_TOKEN}",
             "Content-Type": "audio/mpeg"
         }
-        # Requesting word-level timestamps is the key
         params = {"return_timestamps": "word"}
         
         logging.info("Sending audio to Hugging Face API and requesting word-level timestamps...")
@@ -195,16 +179,13 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
             logging.warning("API did not return word-level chunks. Falling back to full text.")
             full_text = result.get('text', '')
             if not full_text.strip(): return PlainTextResponse(content="", media_type="text/plain")
-            
             probe_result = ffmpeg.probe(output_temp_path)
             audio_duration = float(probe_result['format']['duration'])
-            # Create one big chunk for the old splitting logic (as a fallback)
             api_word_chunks = [{'text': full_text, 'timestamp': [0, audio_duration]}]
 
-        # --- APPLY THE NEW GROUPING LOGIC ---
+        # --- Apply the final, superior grouping logic ---
         sentence_chunks = group_words_into_sentences(api_word_chunks)
         
-        # Format the final sentence chunks into SRT
         srt_output = format_to_srt(sentence_chunks)
         return PlainTextResponse(content=srt_output, media_type="text/plain")
         
