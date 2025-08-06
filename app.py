@@ -5,6 +5,7 @@ import time
 import uvicorn
 import tempfile
 import ffmpeg
+import re # Import the regular expression library
 from datetime import timedelta
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, Response, PlainTextResponse
@@ -32,31 +33,75 @@ if not HF_TOKEN:
 API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
 
 
-# --- SRT Formatting Helper Function ---
-# FINAL VERSION: This version is robust and handles missing API timestamps.
-def format_to_srt(chunks, total_duration_seconds=None):
+# --- Chunk Refining Function for Better Subtitles ---
+def refine_and_split_chunks(chunks, max_chars=85, max_duration_s=10):
     """
-    Formats the output from the Whisper API into a standard SRT subtitle file.
-    Uses the total audio duration as a fallback for missing end timestamps.
+    Refines and splits subtitle chunks to ensure they are readable.
+    Splits chunks that are too long by text length or duration.
+    """
+    refined_chunks = []
+    
+    for chunk in chunks:
+        text = chunk['text'].strip()
+        start_time = chunk['timestamp'][0]
+        end_time = chunk['timestamp'][1]
+
+        if start_time is None: start_time = 0.0
+        if end_time is None: end_time = start_time
+
+        duration = end_time - start_time
+        
+        if len(text) <= max_chars and duration <= max_duration_s:
+            refined_chunks.append(chunk)
+            continue
+            
+        logging.info(f"Splitting a long chunk (len: {len(text)}, dur: {duration:.2f}s): '{text}'")
+        
+        sentences = re.split(r'(?<=[.?!])\s+', text)
+        
+        total_chars = len(text)
+        current_time = start_time
+        
+        for sentence in sentences:
+            if not sentence: continue
+            
+            sentence_chars = len(sentence)
+            # Avoid division by zero if total_chars is 0
+            proportional_duration = (sentence_chars / total_chars) * duration if total_chars > 0 else 0
+            
+            sentence_end_time = current_time + proportional_duration
+            
+            new_chunk = {
+                'text': sentence,
+                'timestamp': [current_time, sentence_end_time]
+            }
+            refined_chunks.append(new_chunk)
+            
+            current_time = sentence_end_time
+            
+    return refined_chunks
+
+
+# --- SRT Formatting Helper Function ---
+def format_to_srt(chunks):
+    """
+    Formats a list of subtitle chunks into a standard SRT file string.
     """
     def format_srt_time(seconds_float):
-        """Converts a float number of seconds to an SRT time string HH:MM:SS,ms."""
         if seconds_float is None or seconds_float < 0:
             seconds_float = 0.0
         
         delta = timedelta(seconds=seconds_float)
-        total_seconds = int(delta.total_seconds())
-        hours, remainder = divmod(total_seconds, 3600)
+        total_seconds_int = int(delta.total_seconds())
+        hours, remainder = divmod(total_seconds_int, 3600)
         minutes, seconds = divmod(remainder, 60)
         milliseconds = delta.microseconds // 1000
         
         return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
     srt_content = []
-    # If there are no chunks from the API, create one master chunk with the full text.
-    if not chunks and total_duration_seconds is not None:
-         # This case is less common now but good for safety
-         return f"1\n{format_srt_time(0)} --> {format_srt_time(total_duration_seconds)}\n[Transcription text not available in chunks]\n"
+    if not chunks:
+        return ""
 
     for i, chunk in enumerate(chunks):
         start_time_val = chunk.get('timestamp', [0, None])[0]
@@ -64,16 +109,7 @@ def format_to_srt(chunks, total_duration_seconds=None):
         text = chunk.get('text', '').strip()
 
         start_time = format_srt_time(start_time_val)
-
-        # --- THE CRITICAL FIX IS HERE ---
-        # If the end time is invalid (null, 0, or same as start), and we have a total duration,
-        # use the total duration for the very last chunk. This correctly times single-chunk results.
-        if (end_time_val is None or end_time_val <= start_time_val) and (i == len(chunks) - 1) and total_duration_seconds:
-             end_time = format_srt_time(total_duration_seconds)
-             logging.info(f"API returned invalid end timestamp. Using probed file duration: {total_duration_seconds}s")
-        else:
-             # Otherwise, use the API's provided end time.
-             end_time = format_srt_time(end_time_val)
+        end_time = format_srt_time(end_time_val)
 
         srt_content.append(f"{i + 1}\n{start_time} --> {end_time}\n{text}\n")
         
@@ -97,14 +133,15 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
             temp_file.write(content)
             input_temp_path = temp_file.name
 
-        output_temp_path = os.path.splitext(input_temp_path)[0] + ".mp3"
+        base_name, _ = os.path.splitext(input_temp_path)
+        output_temp_path = f"{base_name}_processed.mp3"
 
         logging.info(f"Extracting audio from '{input_temp_path}' to '{output_temp_path}'")
         try:
             (
                 ffmpeg
                 .input(input_temp_path)
-                .output(output_temp_path, acodec='libmp3lame', audio_bitrate='192k')
+                .output(output_temp_path, acodec='libmp3lame', audio_bitrate='192k', **{'map_metadata': -1})
                 .run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
             )
             logging.info("Audio extraction successful.")
@@ -113,12 +150,6 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
             logging.error(f"FFmpeg Error: {error_details}")
             raise HTTPException(status_code=500, detail=f"Failed to process media file. FFmpeg error: {error_details}")
 
-        # --- NEW STEP: PROBE THE AUDIO FILE FOR ITS DURATION ---
-        logging.info(f"Probing '{output_temp_path}' for duration...")
-        probe_result = ffmpeg.probe(output_temp_path)
-        audio_duration = float(probe_result['format']['duration'])
-        logging.info(f"Detected audio duration: {audio_duration:.2f} seconds.")
-
         with open(output_temp_path, 'rb') as f:
             audio_data = f.read()
 
@@ -126,7 +157,12 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
             "Authorization": f"Bearer {HF_TOKEN}",
             "Content-Type": "audio/mpeg"
         }
-        params = {"return_timestamps": "chunk"}
+        
+        # --- THIS IS THE CHANGE ---
+        # We are now asking for 'word' level timestamps instead of 'chunk'.
+        params = {"return_timestamps": "word"}
+        logging.info(f"Requesting word-level timestamps with params: {params}")
+        # --- END OF CHANGE ---
         
         start_time = time.time()
         logging.info("Sending extracted audio to Hugging Face API...")
@@ -137,17 +173,23 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
         response.raise_for_status()
         
         result = response.json()
+        logging.info(f"Received JSON response from API: {result}") # Log the raw response to see what we get
         
-        # --- PASS THE DURATION TO THE FORMATTER ---
-        # The API can return the full text in 'text' and chunked text in 'chunks'.
-        # We prioritize chunks if they exist.
         api_chunks = result.get('chunks')
         if not api_chunks:
-            # If the API returns no chunks, create a single one from the main text
             full_text = result.get('text', '[No text returned from API]')
-            api_chunks = [{'text': full_text, 'timestamp': [0, None]}]
+            if full_text and full_text.strip():
+                probe_result = ffmpeg.probe(output_temp_path)
+                audio_duration = float(probe_result['format']['duration'])
+                api_chunks = [{'text': full_text, 'timestamp': [0, audio_duration]}]
+            else:
+                api_chunks = []
 
-        srt_output = format_to_srt(api_chunks, total_duration_seconds=audio_duration)
+        # We keep the refine function here. If the API returns big chunks anyway, it will split them.
+        # If it returns small word-level chunks, the refine function will just pass them through.
+        refined_chunks = refine_and_split_chunks(api_chunks)
+        
+        srt_output = format_to_srt(refined_chunks)
         return PlainTextResponse(content=srt_output, media_type="text/plain")
         
     except requests.exceptions.HTTPError as http_err:
