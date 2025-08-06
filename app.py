@@ -33,53 +33,74 @@ if not HF_TOKEN:
 API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
 
 
-# --- Chunk Refining Function for Better Subtitles ---
-def refine_and_split_chunks(chunks, max_chars=85, max_duration_s=10):
+# --- NEW: Word Grouping Function for Perfect Subtitles ---
+def group_words_into_sentences(word_chunks, max_chars=80, max_duration_s=7.0, pause_threshold=0.7):
     """
-    Refines and splits subtitle chunks to ensure they are readable.
-    Splits chunks that are too long by text length or duration.
+    Groups individual word chunks from the Whisper API into readable sentence chunks.
     """
-    refined_chunks = []
-    
-    for chunk in chunks:
-        text = chunk['text'].strip()
-        start_time = chunk['timestamp'][0]
-        end_time = chunk['timestamp'][1]
+    if not word_chunks:
+        return []
 
-        if start_time is None: start_time = 0.0
-        if end_time is None: end_time = start_time
+    sentence_chunks = []
+    current_sentence = []
+    current_sentence_text = ""
+    sentence_start_time = word_chunks[0]['timestamp'][0]
 
-        duration = end_time - start_time
+    for i, word_chunk in enumerate(word_chunks):
+        word_text = word_chunk['text']
+        start_time = word_chunk['timestamp'][0]
+        end_time = word_chunk['timestamp'][1]
         
-        if len(text) <= max_chars and duration <= max_duration_s:
-            refined_chunks.append(chunk)
-            continue
+        if end_time is None: # Handle potential null end time for the last word
+            end_time = start_time + 0.5 # Estimate a short duration
+
+        # Check for a long pause between words
+        is_long_pause = False
+        if i > 0:
+            prev_word_end_time = word_chunks[i-1]['timestamp'][1]
+            if prev_word_end_time is not None and start_time - prev_word_end_time > pause_threshold:
+                is_long_pause = True
+
+        # Conditions to finalize the current sentence
+        is_end_of_sentence = word_text.strip().endswith(('.', '?', '!'))
+        is_max_chars_reached = len(current_sentence_text + word_text) > max_chars
+        is_max_duration_reached = (end_time - sentence_start_time) > max_duration_s
+
+        if current_sentence and (is_long_pause or is_end_of_sentence or is_max_chars_reached or is_max_duration_reached):
+            # Finalize the sentence
+            last_word_in_sentence = current_sentence[-1]
+            sentence_end_time = last_word_in_sentence['timestamp'][1]
             
-        logging.info(f"Splitting a long chunk (len: {len(text)}, dur: {duration:.2f}s): '{text}'")
+            sentence_chunks.append({
+                'text': ' '.join(w['text'] for w in current_sentence).strip(),
+                'timestamp': [sentence_start_time, sentence_end_time]
+            })
+            
+            # Start a new sentence
+            current_sentence = []
+            current_sentence_text = ""
+            sentence_start_time = start_time
+
+        # Add the current word to the new sentence
+        current_sentence.append(word_chunk)
+        current_sentence_text += word_text
+
+    # Add the last remaining sentence
+    if current_sentence:
+        last_word_in_sentence = current_sentence[-1]
+        sentence_end_time = last_word_in_sentence['timestamp'][1]
         
-        sentences = re.split(r'(?<=[.?!])\s+', text)
+        # Ensure the final end_time is not null
+        if sentence_end_time is None:
+             sentence_end_time = last_word_in_sentence['timestamp'][0] + 0.5
+
+        sentence_chunks.append({
+            'text': ' '.join(w['text'] for w in current_sentence).strip(),
+            'timestamp': [sentence_start_time, sentence_end_time]
+        })
         
-        total_chars = len(text)
-        current_time = start_time
-        
-        for sentence in sentences:
-            if not sentence: continue
-            
-            sentence_chars = len(sentence)
-            # Avoid division by zero if total_chars is 0
-            proportional_duration = (sentence_chars / total_chars) * duration if total_chars > 0 else 0
-            
-            sentence_end_time = current_time + proportional_duration
-            
-            new_chunk = {
-                'text': sentence,
-                'timestamp': [current_time, sentence_end_time]
-            }
-            refined_chunks.append(new_chunk)
-            
-            current_time = sentence_end_time
-            
-    return refined_chunks
+    logging.info(f"Grouped {len(word_chunks)} words into {len(sentence_chunks)} sentences.")
+    return sentence_chunks
 
 
 # --- SRT Formatting Helper Function ---
@@ -107,6 +128,10 @@ def format_to_srt(chunks):
         start_time_val = chunk.get('timestamp', [0, None])[0]
         end_time_val = chunk.get('timestamp', [None, 0])[1]
         text = chunk.get('text', '').strip()
+
+        # FIX for potential null end time
+        if end_time_val is None:
+            end_time_val = start_time_val + 0.5 # Use start time if end is missing
 
         start_time = format_srt_time(start_time_val)
         end_time = format_srt_time(end_time_val)
@@ -144,7 +169,6 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
                 .output(output_temp_path, acodec='libmp3lame', audio_bitrate='192k', **{'map_metadata': -1})
                 .run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
             )
-            logging.info("Audio extraction successful.")
         except ffmpeg.Error as e:
             error_details = e.stderr.decode() if e.stderr else "Unknown FFmpeg error"
             logging.error(f"FFmpeg Error: {error_details}")
@@ -157,39 +181,31 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
             "Authorization": f"Bearer {HF_TOKEN}",
             "Content-Type": "audio/mpeg"
         }
-        
-        # --- THIS IS THE CHANGE ---
-        # We are now asking for 'word' level timestamps instead of 'chunk'.
+        # Requesting word-level timestamps is the key
         params = {"return_timestamps": "word"}
-        logging.info(f"Requesting word-level timestamps with params: {params}")
-        # --- END OF CHANGE ---
         
-        start_time = time.time()
-        logging.info("Sending extracted audio to Hugging Face API...")
+        logging.info("Sending audio to Hugging Face API and requesting word-level timestamps...")
         response = requests.post(API_URL, headers=request_headers, data=audio_data, params=params, timeout=300)
-        duration = time.time() - start_time
-        logging.info(f"AI model processing took {duration:.2f} seconds.")
-        
         response.raise_for_status()
         
         result = response.json()
-        logging.info(f"Received JSON response from API: {result}") # Log the raw response to see what we get
         
-        api_chunks = result.get('chunks')
-        if not api_chunks:
-            full_text = result.get('text', '[No text returned from API]')
-            if full_text and full_text.strip():
-                probe_result = ffmpeg.probe(output_temp_path)
-                audio_duration = float(probe_result['format']['duration'])
-                api_chunks = [{'text': full_text, 'timestamp': [0, audio_duration]}]
-            else:
-                api_chunks = []
+        api_word_chunks = result.get('chunks')
+        if not api_word_chunks:
+            logging.warning("API did not return word-level chunks. Falling back to full text.")
+            full_text = result.get('text', '')
+            if not full_text.strip(): return PlainTextResponse(content="", media_type="text/plain")
+            
+            probe_result = ffmpeg.probe(output_temp_path)
+            audio_duration = float(probe_result['format']['duration'])
+            # Create one big chunk for the old splitting logic (as a fallback)
+            api_word_chunks = [{'text': full_text, 'timestamp': [0, audio_duration]}]
 
-        # We keep the refine function here. If the API returns big chunks anyway, it will split them.
-        # If it returns small word-level chunks, the refine function will just pass them through.
-        refined_chunks = refine_and_split_chunks(api_chunks)
+        # --- APPLY THE NEW GROUPING LOGIC ---
+        sentence_chunks = group_words_into_sentences(api_word_chunks)
         
-        srt_output = format_to_srt(refined_chunks)
+        # Format the final sentence chunks into SRT
+        srt_output = format_to_srt(sentence_chunks)
         return PlainTextResponse(content=srt_output, media_type="text/plain")
         
     except requests.exceptions.HTTPError as http_err:
