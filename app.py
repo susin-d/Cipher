@@ -87,7 +87,10 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
             audio_data = f.read()
 
         # 4. Send the extracted audio to Hugging Face API
-        request_headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        request_headers = {
+            "Authorization": f"Bearer {HF_TOKEN}",
+            "Content-Type": "audio/mpeg"  # <-- FIX: Added the content type header
+        }
         params = {"return_timestamps": "chunk"}
         
         start_time = time.time()
