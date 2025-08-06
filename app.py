@@ -33,46 +33,49 @@ API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
 
 
 # --- SRT Formatting Helper Function ---
-# REPLACEMENT for the original complex function. This is much cleaner and more accurate.
-def format_to_srt(chunks):
+# FINAL VERSION: This version is robust and handles missing API timestamps.
+def format_to_srt(chunks, total_duration_seconds=None):
     """
     Formats the output from the Whisper API into a standard SRT subtitle file.
-    Handles cases where timestamps might be missing or null.
+    Uses the total audio duration as a fallback for missing end timestamps.
     """
     def format_srt_time(seconds_float):
         """Converts a float number of seconds to an SRT time string HH:MM:SS,ms."""
-        if seconds_float is None:
+        if seconds_float is None or seconds_float < 0:
             seconds_float = 0.0
         
-        # Create a timedelta object to easily extract components
         delta = timedelta(seconds=seconds_float)
-        
-        # Extract hours, minutes, seconds from the total seconds
-        total_seconds = delta.seconds
+        total_seconds = int(delta.total_seconds())
         hours, remainder = divmod(total_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
-        
-        # Extract milliseconds from the microseconds component
         milliseconds = delta.microseconds // 1000
         
         return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
     srt_content = []
+    # If there are no chunks from the API, create one master chunk with the full text.
+    if not chunks and total_duration_seconds is not None:
+         # This case is less common now but good for safety
+         return f"1\n{format_srt_time(0)} --> {format_srt_time(total_duration_seconds)}\n[Transcription text not available in chunks]\n"
+
     for i, chunk in enumerate(chunks):
-        # Default to 0 if timestamps are missing or null
-        start_time = chunk.get('timestamp', [0, None])[0] or 0
-        end_time = chunk.get('timestamp', [None, 0])[1]
-
-        # If end_time is null, make it the same as start_time for a valid, 0-duration subtitle
-        if end_time is None:
-            end_time = start_time
-
+        start_time_val = chunk.get('timestamp', [0, None])[0]
+        end_time_val = chunk.get('timestamp', [None, 0])[1]
         text = chunk.get('text', '').strip()
 
-        start_srt_time = format_srt_time(start_time)
-        end_srt_time = format_srt_time(end_time)
-        
-        srt_content.append(f"{i + 1}\n{start_srt_time} --> {end_srt_time}\n{text}\n")
+        start_time = format_srt_time(start_time_val)
+
+        # --- THE CRITICAL FIX IS HERE ---
+        # If the end time is invalid (null, 0, or same as start), and we have a total duration,
+        # use the total duration for the very last chunk. This correctly times single-chunk results.
+        if (end_time_val is None or end_time_val <= start_time_val) and (i == len(chunks) - 1) and total_duration_seconds:
+             end_time = format_srt_time(total_duration_seconds)
+             logging.info(f"API returned invalid end timestamp. Using probed file duration: {total_duration_seconds}s")
+        else:
+             # Otherwise, use the API's provided end time.
+             end_time = format_srt_time(end_time_val)
+
+        srt_content.append(f"{i + 1}\n{start_time} --> {end_time}\n{text}\n")
         
     return "\n".join(srt_content)
 
@@ -89,13 +92,11 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
     output_temp_path = None
     
     try:
-        # 1. Save uploaded file to a temporary location
         with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as temp_file:
             content = await file.read()
             temp_file.write(content)
             input_temp_path = temp_file.name
 
-        # 2. Extract audio using FFmpeg
         output_temp_path = os.path.splitext(input_temp_path)[0] + ".mp3"
 
         logging.info(f"Extracting audio from '{input_temp_path}' to '{output_temp_path}'")
@@ -112,11 +113,15 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
             logging.error(f"FFmpeg Error: {error_details}")
             raise HTTPException(status_code=500, detail=f"Failed to process media file. FFmpeg error: {error_details}")
 
-        # 3. Read the extracted audio data
+        # --- NEW STEP: PROBE THE AUDIO FILE FOR ITS DURATION ---
+        logging.info(f"Probing '{output_temp_path}' for duration...")
+        probe_result = ffmpeg.probe(output_temp_path)
+        audio_duration = float(probe_result['format']['duration'])
+        logging.info(f"Detected audio duration: {audio_duration:.2f} seconds.")
+
         with open(output_temp_path, 'rb') as f:
             audio_data = f.read()
 
-        # 4. Send the extracted audio to Hugging Face API
         request_headers = {
             "Authorization": f"Bearer {HF_TOKEN}",
             "Content-Type": "audio/mpeg"
@@ -132,7 +137,17 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
         response.raise_for_status()
         
         result = response.json()
-        srt_output = format_to_srt(result.get('chunks', []))
+        
+        # --- PASS THE DURATION TO THE FORMATTER ---
+        # The API can return the full text in 'text' and chunked text in 'chunks'.
+        # We prioritize chunks if they exist.
+        api_chunks = result.get('chunks')
+        if not api_chunks:
+            # If the API returns no chunks, create a single one from the main text
+            full_text = result.get('text', '[No text returned from API]')
+            api_chunks = [{'text': full_text, 'timestamp': [0, None]}]
+
+        srt_output = format_to_srt(api_chunks, total_duration_seconds=audio_duration)
         return PlainTextResponse(content=srt_output, media_type="text/plain")
         
     except requests.exceptions.HTTPError as http_err:
@@ -147,13 +162,12 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
         logging.error(f"An internal error occurred: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # 5. IMPORTANT: Clean up the temporary files
         if input_temp_path and os.path.exists(input_temp_path):
             os.remove(input_temp_path)
         if output_temp_path and os.path.exists(output_temp_path):
             os.remove(output_temp_path)
 
-# --- Embedded Frontend Content ---
+# --- Embedded Frontend Content (unchanged) ---
 
 HTML_CONTENT = """
 <!DOCTYPE html>
