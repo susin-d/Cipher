@@ -1,14 +1,13 @@
 import os
 import logging
-import requests
-import time
 import uvicorn
 import tempfile
 import ffmpeg
-import re # Import the regular expression library
+import whisper # <-- Import the whisper library
 from datetime import timedelta
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import HTMLResponse, Response, PlainTextResponse
+from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -17,7 +16,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = FastAPI()
 
-# --- CORS Middleware (Good practice for web apps) ---
+# --- CORS Middleware ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,117 +25,74 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Hugging Face API Configuration ---
-HF_TOKEN = os.environ.get('HUGGING_FACE_TOKEN')
-if not HF_TOKEN:
-    logging.warning("HUGGING_FACE_TOKEN not found in environment. The API will not work.")
-API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
+# --- LOCAL WHISPER MODEL CONFIGURATION ---
+try:
+    MODEL_SIZE = os.environ.get("MODEL_SIZE", "base")
+    logging.info(f"--- Loading local Whisper model: {MODEL_SIZE} ---")
+    # This line downloads the model to a cache directory on first run
+    model = whisper.load_model(MODEL_SIZE)
+    logging.info("--- Whisper model loaded successfully. ---")
+except Exception as e:
+    logging.error(f"Failed to load Whisper model: {e}")
+    model = None
 
 
-# --- FINAL REVISED: Word Grouping Function for Perfect Subtitles ---
+# --- Word Grouping Function for Perfect Subtitles ---
+# This function is compatible with the output from the local model
 def group_words_into_sentences(word_chunks, max_chars=42, pause_threshold=0.7):
-    """
-    Groups individual word chunks from the Whisper API into readable sentence chunks.
-    This version uses simpler logic and correctly handles line breaks and text formatting.
-    """
     if not word_chunks:
         return []
-
-    sentence_chunks = []
-    current_sentence = []
-
+    sentence_chunks, current_sentence = [], []
     for i, word_chunk in enumerate(word_chunks):
         current_sentence.append(word_chunk)
-        
-        # --- Correctly form the sentence text by stripping each word ---
-        current_text = ' '.join(w['text'].strip() for w in current_sentence)
-
-        # --- Define break conditions ---
+        current_text = ' '.join(w['text'] for w in current_sentence) # Changed from w['text'].strip()
         is_punctuation_end = word_chunk['text'].strip().endswith(('.', '?', '!'))
         is_max_len_reached = len(current_text) >= max_chars
-        
-        # Check for a pause after the current word
         is_pause_after = False
         if i < len(word_chunks) - 1:
             next_word_start = word_chunks[i+1]['timestamp'][0]
             current_word_end = word_chunk['timestamp'][1]
-            if current_word_end is not None and next_word_start is not None:
-                 if next_word_start - current_word_end > pause_threshold:
-                    is_pause_after = True
-        
+            if current_word_end is not None and next_word_start is not None and (next_word_start - current_word_end > pause_threshold):
+                is_pause_after = True
         is_last_word = (i == len(word_chunks) - 1)
-
-        # --- Finalize the sentence if any break condition is met ---
         if is_last_word or is_punctuation_end or is_pause_after or is_max_len_reached:
-            if not current_sentence:
-                continue
-
+            if not current_sentence: continue
             start_ts = current_sentence[0]['timestamp'][0]
             end_ts = current_sentence[-1]['timestamp'][1]
-            
-            # Handle potential null timestamp on the very last word
-            if end_ts is None:
-                end_ts = current_sentence[-1]['timestamp'][0] + 0.5
-            
-            sentence_chunks.append({
-                'text': current_text,
-                'timestamp': [start_ts, end_ts]
-            })
-            # Reset for the next sentence
+            sentence_chunks.append({'text': current_text, 'timestamp': [start_ts, end_ts]})
             current_sentence = []
-    
     logging.info(f"Grouped {len(word_chunks)} words into {len(sentence_chunks)} sentences.")
     return sentence_chunks
 
-
-# --- SRT Formatting Helper Function ---
+# --- SRT Formatting Helper Function (Unchanged) ---
 def format_to_srt(chunks):
-    """
-    Formats a list of subtitle chunks into a standard SRT file string.
-    """
     def format_srt_time(seconds_float):
-        if seconds_float is None or seconds_float < 0:
-            seconds_float = 0.0
-        
+        if seconds_float is None or seconds_float < 0: seconds_float = 0.0
         delta = timedelta(seconds=seconds_float)
-        total_seconds_int = int(delta.total_seconds())
-        hours, remainder = divmod(total_seconds_int, 3600)
+        hours, remainder = divmod(int(delta.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
         milliseconds = delta.microseconds // 1000
-        
         return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
-
     srt_content = []
-    if not chunks:
-        return ""
-
+    if not chunks: return ""
     for i, chunk in enumerate(chunks):
-        start_time_val = chunk.get('timestamp', [0, None])[0]
-        end_time_val = chunk.get('timestamp', [None, 0])[1]
+        start_time_val = chunk.get('timestamp', [0, 0])[0]
+        end_time_val = chunk.get('timestamp', [0, 0.5])[1] or (start_time_val + 0.5)
         text = chunk.get('text', '').strip()
-
-        if end_time_val is None:
-            end_time_val = start_time_val + 0.5 
-
         start_time = format_srt_time(start_time_val)
         end_time = format_srt_time(end_time_val)
-
         srt_content.append(f"{i + 1}\n{start_time} --> {end_time}\n{text}\n")
-        
     return "\n".join(srt_content)
 
 
-# --- API Endpoint (Handles Video and Audio) ---
-@app.post("/api/process_hf")
-async def process_audio_with_huggingface(file: UploadFile = File(...)):
-    if not HF_TOKEN:
-        raise HTTPException(status_code=500, detail="Server is not configured with an API token.")
-    
+# --- API Endpoint (Now uses local Whisper model) ---
+@app.post("/api/process_local")
+async def process_audio_locally(file: UploadFile = File(...)):
+    if not model:
+        raise HTTPException(status_code=500, detail="Whisper model is not loaded. Check server logs.")
+
     logging.info(f"--- API call received for file: {file.filename} ---")
-    
-    input_temp_path = None
-    output_temp_path = None
-    
+    input_temp_path, output_temp_path = None, None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as temp_file:
             content = await file.read()
@@ -145,399 +101,55 @@ async def process_audio_with_huggingface(file: UploadFile = File(...)):
 
         base_name, _ = os.path.splitext(input_temp_path)
         output_temp_path = f"{base_name}_processed.mp3"
-
         logging.info(f"Extracting audio from '{input_temp_path}' to '{output_temp_path}'")
         try:
-            (
-                ffmpeg
-                .input(input_temp_path)
-                .output(output_temp_path, acodec='libmp3lame', audio_bitrate='192k', **{'map_metadata': -1})
-                .run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
-            )
+            ffmpeg.input(input_temp_path).output(output_temp_path, acodec='libmp3lame', audio_bitrate='192k', **{'map_metadata': -1}).run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
         except ffmpeg.Error as e:
             error_details = e.stderr.decode() if e.stderr else "Unknown FFmpeg error"
-            logging.error(f"FFmpeg Error: {error_details}")
             raise HTTPException(status_code=500, detail=f"Failed to process media file. FFmpeg error: {error_details}")
 
-        with open(output_temp_path, 'rb') as f:
-            audio_data = f.read()
+        # --- THIS IS THE CORE CHANGE: USE LOCAL MODEL ---
+        logging.info(f"Transcribing '{output_temp_path}' with local Whisper model...")
+        result = model.transcribe(output_temp_path, word_timestamps=True, fp16=False) # fp16=False for CPU
+        
+        # --- Adapt local whisper output to the format our grouping function expects ---
+        all_words = []
+        for segment in result.get('segments', []):
+            all_words.extend(segment.get('words', []))
+        
+        if not all_words:
+             logging.warning("Whisper did not return any words. Returning full text as one chunk.")
+             full_text = result.get('text', '').strip()
+             if not full_text: return PlainTextResponse(content="", media_type="text/plain")
+             duration = float(ffmpeg.probe(output_temp_path)['format']['duration'])
+             word_chunks_for_grouping = [{'text': full_text, 'timestamp': [0, duration]}]
+        else:
+            word_chunks_for_grouping = [
+                {'text': word['word'].strip(), 'timestamp': [word['start'], word['end']]}
+                for word in all_words
+            ]
 
-        request_headers = {
-            "Authorization": f"Bearer {HF_TOKEN}",
-            "Content-Type": "audio/mpeg"
-        }
-        params = {"return_timestamps": "word"}
-        
-        logging.info("Sending audio to Hugging Face API and requesting word-level timestamps...")
-        response = requests.post(API_URL, headers=request_headers, data=audio_data, params=params, timeout=300)
-        response.raise_for_status()
-        
-        result = response.json()
-        
-        api_word_chunks = result.get('chunks')
-        if not api_word_chunks:
-            logging.warning("API did not return word-level chunks. Falling back to full text.")
-            full_text = result.get('text', '')
-            if not full_text.strip(): return PlainTextResponse(content="", media_type="text/plain")
-            probe_result = ffmpeg.probe(output_temp_path)
-            audio_duration = float(probe_result['format']['duration'])
-            api_word_chunks = [{'text': full_text, 'timestamp': [0, audio_duration]}]
-
-        # --- Apply the final, superior grouping logic ---
-        sentence_chunks = group_words_into_sentences(api_word_chunks)
-        
+        sentence_chunks = group_words_into_sentences(word_chunks_for_grouping)
         srt_output = format_to_srt(sentence_chunks)
         return PlainTextResponse(content=srt_output, media_type="text/plain")
-        
-    except requests.exceptions.HTTPError as http_err:
-        error_detail = "Unknown error"
-        try:
-            error_detail = http_err.response.json().get('error', http_err.response.text)
-        except requests.exceptions.JSONDecodeError:
-            error_detail = http_err.response.text
-        logging.error(f"Hugging Face API Error: {error_detail}")
-        raise HTTPException(status_code=502, detail=f"AI model processing failed: {error_detail}")
+
     except Exception as e:
         logging.error(f"An internal error occurred: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if input_temp_path and os.path.exists(input_temp_path):
-            os.remove(input_temp_path)
-        if output_temp_path and os.path.exists(output_temp_path):
-            os.remove(output_temp_path)
+        if input_temp_path and os.path.exists(input_temp_path): os.remove(input_temp_path)
+        if output_temp_path and os.path.exists(output_temp_path): os.remove(output_temp_path)
 
-# --- Embedded Frontend Content (unchanged) ---
+# --- Static File Serving (Unchanged) ---
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-HTML_CONTENT = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Subtitle Generator</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="/static/css/style.css">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-</head>
-<body class="bg-[#0b0b12] min-h-screen flex items-center justify-center p-4 relative overflow-hidden">
-    <canvas id="waveCanvas"></canvas>
-
-    <div class="glass-effect p-8 rounded-lg shadow-2xl w-full max-w-md text-center border border-gray-700/50 z-10">
-        <h1 class="text-3xl font-bold text-gray-100 mb-6">Cipher Converter</h1>
-        <p class="text-gray-300 mb-8">Upload any video or audio file (MP4, MOV, MP3, etc.) to generate SRT subtitles automatically.</p>
-
-        <div class="mb-6 flex justify-center">
-            <label for="fileInputFiles" class="custom-file-upload glass-button text-gray-200 font-semibold py-3 px-6 rounded-lg">
-                Choose File
-            </label>
-            <input type="file" id="fileInputFiles" accept="audio/*,video/*" style="display: none;">
-        </div>
-        <p id="fileNameDisplay" class="mt-4 text-gray-400 text-sm italic h-5"></p>
-
-        <button id="processButton"
-            class="w-full glass-button text-white font-semibold py-3 px-4 rounded-lg"
-            disabled>
-            Process File
-        </button>
-
-        <div id="loadingIndicator" class="mt-4 hidden">
-            <div class="flex justify-center items-center space-x-2">
-                <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                <p class="text-sm text-gray-400">Processing... this may take a moment.</p>
-            </div>
-        </div>
-
-        <div id="downloadLinksContainer" class="hidden mt-6">
-            <h3 class="text-lg font-semibold text-gray-200 mb-2">Download Your File:</h3>
-            <div id="downloadLinksList" class="text-center"></div>
-        </div>
-
-        <div id="messageArea" class="mt-6 text-sm text-red-400 min-h-[20px]"></div>
-    </div>
-
-    <script src="/static/js/script.js" defer></script>
-</body>
-</html>
-"""
-
-CSS_CONTENT = """
-/* --- Global Styles & Font --- */
-body {
-    font-family: 'Inter', sans-serif;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-}
-
-/* --- Main Glass Effect Card --- */
-.glass-effect {
-    background: rgba(18, 18, 28, 0.7);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-}
-
-/* --- Canvas Background --- */
-#waveCanvas {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    z-index: 0;
-}
-
-
-/* --- Glossy Glass Button Style --- */
-.glass-button {
-    background: rgba(255, 255, 255, 0.1);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
-    transition: all 0.3s ease;
-}
-
-.glass-button:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.2);
-    border: 1px solid rgba(255, 255, 255, 0.4);
-    transform: scale(1.05);
-}
-
-.glass-button:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
-
-/* --- Custom File Upload Styling --- */
-input[type="file"] {
-    display: none;
-}
-
-.custom-file-upload {
-    display: inline-block;
-    cursor: pointer;
-}
-
-.hidden {
-    display: none !important;
-}
-"""
-
-JS_CONTENT = """
-document.addEventListener('DOMContentLoaded', () => {
-    // --- 1. DOM Element Selection ---
-    const fileInputFiles = document.getElementById('fileInputFiles');
-    const fileNameDisplay = document.getElementById('fileNameDisplay');
-    const processButton = document.getElementById('processButton');
-    const loadingIndicator = document.getElementById('loadingIndicator');
-    const messageArea = document.getElementById('messageArea');
-    const downloadLinksContainer = document.getElementById('downloadLinksContainer');
-    const downloadLinksList = document.getElementById('downloadLinksList');
-    const canvas = document.getElementById('waveCanvas');
-    const ctx = canvas.getContext('2d');
-
-    // --- 2. State Management ---
-    let selectedFile = null;
-
-    // --- 3. Main Application Logic ---
-    fileInputFiles.addEventListener('change', (event) => {
-        if (event.target.files.length > 0) {
-            selectedFile = event.target.files[0];
-            fileNameDisplay.textContent = `Selected: ${selectedFile.name}`;
-            messageArea.textContent = '';
-            downloadLinksContainer.classList.add('hidden');
-            processButton.disabled = false;
-        } else {
-            selectedFile = null;
-            fileNameDisplay.textContent = '';
-            processButton.disabled = true;
-        }
-    });
-
-    processButton.addEventListener('click', async () => {
-        if (!selectedFile) {
-            messageArea.textContent = 'Please select a file first.';
-            return;
-        }
-        processButton.disabled = true;
-        loadingIndicator.classList.remove('hidden');
-        messageArea.textContent = '';
-        downloadLinksContainer.classList.add('hidden');
-        downloadLinksList.innerHTML = '';
-        
-        const formData = new FormData();
-        formData.append('file', selectedFile);
-
-        try {
-            const response = await fetch('/api/process_hf', { method: 'POST', body: formData });
-            
-            if (!response.ok) {
-                const contentType = response.headers.get("content-type");
-                let errorMessage;
-                if (contentType && contentType.indexOf("application/json") !== -1) {
-                    const errorData = await response.json();
-                    errorMessage = errorData.detail || 'An unknown server error occurred.';
-                } else { 
-                    errorMessage = await response.text(); 
-                }
-                throw new Error(errorMessage);
-            }
-            
-            const srtContent = await response.text();
-            const blob = new Blob([srtContent], { type: 'text/plain;charset=utf-8' });
-            const url = URL.createObjectURL(blob);
-            const originalFileName = selectedFile.name.split('.').slice(0, -1).join('.');
-            
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = `${originalFileName}.srt`;
-            link.textContent = `Download Subtitles (.srt)`;
-            link.className = "text-violet-400 hover:text-violet-300 underline block text-lg";
-            
-            downloadLinksList.appendChild(link);
-            downloadLinksContainer.classList.remove('hidden');
-
-        } catch (error) {
-            console.error('An error occurred during processing:', error);
-            messageArea.textContent = `Error: ${error.message}`;
-        } finally {
-            loadingIndicator.classList.add('hidden');
-            processButton.disabled = false;
-        }
-    });
-
-    // --- 4. CONSTELLATION PARTICLE NETWORK ANIMATION ---
-    let particles = [];
-    const numParticles = 100;
-    const maxDistance = 120;
-    const particleSpeed = 0.5;
-    const mouse = { x: undefined, y: undefined };
-
-    window.addEventListener('mousemove', (event) => {
-        mouse.x = event.x;
-        mouse.y = event.y;
-    });
-    
-    window.addEventListener('mouseout', () => {
-        mouse.x = undefined;
-        mouse.y = undefined;
-    });
-
-    class Particle {
-        constructor() {
-            this.x = Math.random() * canvas.width;
-            this.y = Math.random() * canvas.height;
-            this.vx = (Math.random() - 0.5) * particleSpeed;
-            this.vy = (Math.random() - 0.5) * particleSpeed;
-            this.radius = Math.random() * 1.5 + 1;
-            this.hue = 220 + Math.random() * 80;
-        }
-
-        update() {
-            this.x += this.vx;
-            this.y += this.vy;
-            if (this.x < 0 || this.x > canvas.width) this.vx *= -1;
-            if (this.y < 0 || this.y > canvas.height) this.vy *= -1;
-        }
-
-        draw() {
-            ctx.beginPath();
-            ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
-            ctx.fillStyle = `hsl(${this.hue}, 100%, 70%)`;
-            ctx.fill();
-        }
-    }
-
-    function setupAnimation() {
-        canvas.width = window.innerWidth;
-        canvas.height = window.innerHeight;
-        particles = [];
-        for (let i = 0; i < numParticles; i++) {
-            particles.push(new Particle());
-        }
-    }
-
-    function drawLines() {
-        for (let i = 0; i < particles.length; i++) {
-            for (let j = i + 1; j < particles.length; j++) {
-                const dx = particles[i].x - particles[j].x;
-                const dy = particles[i].y - particles[j].y;
-                const distance = Math.sqrt(dx * dx + dy * dy);
-
-                if (distance < maxDistance) {
-                    const opacity = 1 - distance / maxDistance;
-                    ctx.beginPath();
-                    ctx.moveTo(particles[i].x, particles[i].y);
-                    ctx.lineTo(particles[j].x, particles[j].y);
-                    ctx.strokeStyle = `rgba(191, 128, 255, ${opacity})`;
-                    ctx.lineWidth = 0.5;
-                    ctx.stroke();
-                }
-            }
-        }
-    }
-    
-    function drawMouseLines() {
-        if (mouse.x === undefined) return;
-
-        for (let i = 0; i < particles.length; i++) {
-            const dx = particles[i].x - mouse.x;
-            const dy = particles[i].y - mouse.y;
-            const distance = Math.sqrt(dx * dx + dy * dy);
-
-            if (distance < maxDistance * 1.5) {
-                const opacity = 1 - distance / (maxDistance * 1.5);
-                ctx.beginPath();
-                ctx.moveTo(particles[i].x, particles[i].y);
-                ctx.lineTo(mouse.x, mouse.y);
-                ctx.strokeStyle = `rgba(160, 180, 255, ${opacity})`;
-                ctx.lineWidth = 0.7;
-                ctx.stroke();
-            }
-        }
-    }
-
-    function animate() {
-        ctx.fillStyle = '#0b0b12';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        particles.forEach(p => { p.update(); p.draw(); });
-        drawLines();
-        drawMouseLines();
-        requestAnimationFrame(animate);
-    }
-    
-    window.addEventListener('resize', setupAnimation);
-    setupAnimation();
-    animate();
-});
-"""
-
-
-# --- Static File Serving (from embedded content) ---
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
-    """Serves the main HTML page."""
-    return HTMLResponse(content=HTML_CONTENT)
+    return FileResponse('templates/index.html')
 
-@app.get("/static/css/style.css")
-async def read_css():
-    """Serves the CSS file."""
-    return Response(content=CSS_CONTENT, media_type="text/css")
-
-@app.get("/static/js/script.js")
-async def read_js():
-    """Serves the JavaScript file."""
-    return Response(content=JS_CONTENT, media_type="application/javascript")
-
-
-# --- Main entry point for local execution ---
+# --- Main entry point for local execution (Unchanged) ---
 if __name__ == "__main__":
     print("--- Starting local development server ---")
     print("Access the application at http://127.0.0.1:8000")
-    print("Ensure you have a .env file with HUGGING_FACE_TOKEN set.")
-    print("Ensure FFmpeg is installed on your system.")
+    print("NOTE: The first time you run this, it will download the Whisper model, which may take some time.")
     uvicorn.run(app, host="127.0.0.1", port=8000)
