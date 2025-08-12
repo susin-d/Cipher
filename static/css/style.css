@@ -23,34 +23,28 @@ body {
 }
 
 
-/* --- NEW: Glossy Glass Button Style --- */
-/* This reusable class will style both of our buttons */
+/* --- Glossy Glass Button Style --- */
 .glass-button {
-    background: rgba(255, 255, 255, 0.1); /* Semi-transparent white background */
+    background: rgba(255, 255, 255, 0.1);
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
-    border: 1px solid rgba(255, 255, 255, 0.2); /* Subtle white border */
-    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1); /* Soft shadow for depth */
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
     transition: all 0.3s ease;
-    /* Font and padding are handled by Tailwind classes in the HTML */
 }
 
-/* Hover effect for the glass button */
 .glass-button:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.2); /* Get slightly brighter on hover */
+    background: rgba(255, 255, 255, 0.2);
     border: 1px solid rgba(255, 255, 255, 0.4);
-    transform: scale(1.05); /* Add a pop effect */
+    transform: scale(1.05);
 }
 
-/* Disabled state */
 .glass-button:disabled {
     opacity: 0.5;
     cursor: not-allowed;
 }
 
-
-/* --- UPDATED: Custom File Upload Styling --- */
-/* We no longer need all the styling here because we'll use the .glass-button class */
+/* --- Custom File Upload Styling --- */
 input[type="file"] {
     display: none;
 }
@@ -58,10 +52,8 @@ input[type="file"] {
 .custom-file-upload {
     display: inline-block;
     cursor: pointer;
-    /* All appearance styles (background, border, etc.) are now controlled by .glass-button */
 }
 
-/* -- Utility Class -- */
 .hidden {
     display: none !important;
 }
